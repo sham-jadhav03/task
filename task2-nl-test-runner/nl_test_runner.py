@@ -8,14 +8,35 @@ Nothing here is specific to any website: each step the tool shows the model a co
 visible, interactive elements (numbered), the model returns ONE JSON action, the tool executes it, repeat.
 The model finishes with a verdict + evidence; the tool checks that evidence really is on the page.
 """
-import argparse, json, os, re, sys, time
+import argparse
+import json
+import os
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
+from dotenv import load_dotenv
+from google import genai
+from google.genai import errors as google_errors
+from google.genai import types as google_types
 from playwright.sync_api import sync_playwright
 
-MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-5-5")
+load_dotenv()
+
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+PROVIDER = "google" if GOOGLE_API_KEY else "groq" if GROQ_API_KEY else None
+
+if PROVIDER == "google":
+    MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
+elif PROVIDER == "groq":
+    MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+else:
+    MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
+
+FALLBACK_MODEL = os.environ.get("LLM_FALLBACK_MODEL")
+TRANSIENT_API_ERROR_CODES = {429, 500, 502, 503, 504}
 
 SNAPSHOT_JS = r"""
 () => {
@@ -89,10 +110,52 @@ def fmt_snapshot(s):
 def ask_llm(client, test_case, history, snap_text):
     prompt = (f"TEST CASE:\n{test_case}\n\nHISTORY:\n" + ("\n".join(history) or "(none yet)")
               + f"\n\nCURRENT PAGE:\n{snap_text}\n\nNext action (JSON only):")
-    for attempt in range(2):
-        resp = client.messages.create(model=MODEL, max_tokens=500, system=SYSTEM,
-                                      messages=[{"role": "user", "content": prompt}])
-        raw = "".join(b.text for b in resp.content if b.type == "text")
+    models_to_try = [MODEL]
+    if FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        models_to_try.append(FALLBACK_MODEL)
+
+    for attempt, active_model in enumerate(models_to_try):
+        try:
+            if PROVIDER == "google":
+                config = google_types.GenerateContentConfig(
+                    system_instruction=SYSTEM,
+                    max_output_tokens=500,
+                    response_mime_type="application/json",
+                )
+                resp = client.models.generate_content(
+                    model=active_model,
+                    contents=prompt,
+                    config=config,
+                )
+                raw = resp.text or ""
+            else:
+                completion = client.chat.completions.create(
+                    model=active_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                )
+                raw = completion.choices[0].message.content or ""
+        except Exception as exc:
+            error_code = getattr(exc, "code", None)
+            error_status = getattr(exc, "status", None)
+            error_message = getattr(exc, "message", str(exc))
+            transient = error_code in TRANSIENT_API_ERROR_CODES or (isinstance(exc, Exception) and str(exc).lower().find("unavailable") >= 0)
+            if not transient:
+                raise RuntimeError(
+                    f"LLM request failed for {active_model} ({error_code or 'error'} {error_status or ''}): {error_message}"
+                ) from exc
+            if attempt == len(models_to_try) - 1:
+                raise RuntimeError(
+                    f"LLM request failed for {MODEL} ({error_code or 'error'} {error_status or ''}): {error_message}. "
+                    f"Set LLM_FALLBACK_MODEL in .env to another enabled model."
+                ) from exc
+            print(
+                f"  LLM {active_model} returned {error_code or 'error'}; retrying with fallback model {models_to_try[attempt + 1]}.",
+                file=sys.stderr,
+            )
+            continue
+
         m = re.search(r"\{.*\}", raw, re.S)
         if m:
             try:
@@ -105,8 +168,10 @@ def ask_llm(client, test_case, history, snap_text):
 
 def settle(page):
     for state, t in (("domcontentloaded", 5000), ("networkidle", 3000)):
-        try: page.wait_for_load_state(state, timeout=t)
-        except Exception: pass
+        try:
+            page.wait_for_load_state(state, timeout=t)
+        except Exception:
+            pass
     page.wait_for_timeout(500)
 
 
@@ -116,16 +181,25 @@ def execute(page, act, items):
         page.goto(act["url"], wait_until="domcontentloaded", timeout=30000)
     elif a in ("click", "fill", "select", "check"):
         loc = page.locator(f'[data-agent-id="{act["id"]}"]').first
-        if a == "click": loc.click(timeout=7000)
-        elif a == "check": loc.check(timeout=7000)
-        elif a == "fill": loc.fill(str(act["value"]), timeout=7000)
+        if a == "click":
+            loc.click(timeout=7000)
+        elif a == "check":
+            loc.check(timeout=7000)
+        elif a == "fill":
+            loc.fill(str(act["value"]), timeout=7000)
         else:
-            try: loc.select_option(label=str(act["value"]), timeout=5000)
-            except Exception: loc.select_option(value=str(act["value"]), timeout=5000)
-    elif a == "press": page.keyboard.press(act["key"])
-    elif a == "scroll": page.mouse.wheel(0, 700)
-    elif a == "wait": page.wait_for_timeout(min(float(act.get("seconds", 1)), 5) * 1000)
-    else: raise ValueError(f"unknown action {a}")
+            try:
+                loc.select_option(label=str(act["value"]), timeout=5000)
+            except Exception:
+                loc.select_option(value=str(act["value"]), timeout=5000)
+    elif a == "press":
+        page.keyboard.press(act["key"])
+    elif a == "scroll":
+        page.mouse.wheel(0, 700)
+    elif a == "wait":
+        page.wait_for_timeout(min(float(act.get("seconds", 1)), 5) * 1000)
+    else:
+        raise ValueError(f"unknown action {a}")
     settle(page)
 
 
@@ -136,13 +210,21 @@ def describe(act, items):
         d += f' #{item["id"]} ({item["tag"]} "{item["label"] or item["text"] or item["name"] or item["placeholder"]}")'
     if "value" in act:
         d += ' = "***"' if item and item["type"] == "password" else f' = "{act["value"]}"'
-    if "url" in act: d += f' {act["url"]}'
-    if "key" in act: d += f' {act["key"]}'
+    if "url" in act:
+        d += f' {act["url"]}'
+    if "key" in act:
+        d += f' {act["key"]}'
     return d
 
 
 def run(test_case, url, headed, max_steps, outdir):
-    client = anthropic.Anthropic()
+    if PROVIDER == "google":
+        client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+    elif PROVIDER == "groq":
+        from groq import Groq
+        client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    else:
+        raise RuntimeError("Set GOOGLE_API_KEY or GROQ_API_KEY in the environment or .env file.")
     outdir.mkdir(parents=True, exist_ok=True)
     history, steps = [], []
     verdict = {"verdict": "fail", "reason": "Step limit reached without a verdict", "evidence": ""}
@@ -151,11 +233,17 @@ def run(test_case, url, headed, max_steps, outdir):
         ctx = browser.new_context(viewport={"width": 1366, "height": 900})
         page = ctx.new_page()
         if url:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000); settle(page)
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            settle(page)
         for n in range(1, max_steps + 1):
-            page = ctx.pages[-1]                       # follow new tabs/popups
+            page = ctx.pages[-1]
             snap = page.evaluate(SNAPSHOT_JS)
-            act = ask_llm(client, test_case, history, fmt_snapshot(snap))
+            try:
+                act = ask_llm(client, test_case, history, fmt_snapshot(snap))
+            except RuntimeError as exc:
+                verdict = {"verdict": "fail", "reason": str(exc), "evidence": ""}
+                print(f"  step {n}: {exc}")
+                break
             if act.get("action") == "finish":
                 v = str(act.get("verdict", "fail")).lower()
                 ev = str(act.get("evidence", ""))
@@ -174,11 +262,13 @@ def run(test_case, url, headed, max_steps, outdir):
             print(f"  step {n}: {desc} -> {result}   # {act.get('thought', '')}")
             history.append(f"{n}. {desc} -> {result}")
             steps.append({"step": n, "action": desc, "result": result, "thought": act.get("thought", "")})
-        try: ctx.pages[-1].screenshot(path=str(outdir / "final.png"), full_page=False)
-        except Exception: pass
+        try:
+            ctx.pages[-1].screenshot(path=str(outdir / "final.png"), full_page=False)
+        except Exception:
+            pass
         browser.close()
     report = {"test_case": test_case, "url": url, **verdict, "steps": steps}
-    (outdir / "report.json").write_text(json.dumps(report, indent=2))
+    (outdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 
 
@@ -190,8 +280,11 @@ def main():
     ap.add_argument("--headed", action="store_true", help="Show the browser window")
     ap.add_argument("--max-steps", type=int, default=25)
     a = ap.parse_args()
-    tc = Path(a.file).read_text().strip() if a.file else a.test_case
-    if not tc: ap.error("provide a test case or --file")
+    tc = Path(a.file).read_text(encoding="utf-8").strip() if a.file else a.test_case
+    if not tc:
+        ap.error("provide a test case or --file")
+    if not os.environ.get("GOOGLE_API_KEY") and not os.environ.get("GROQ_API_KEY"):
+        ap.error("Set GOOGLE_API_KEY or GROQ_API_KEY in the environment or in a .env file")
     url = a.url or (re.search(r"https?://\S+", tc) or [None])[0]
     outdir = Path("runs") / datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f"TEST: {tc}\nURL : {url}\n")

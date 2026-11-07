@@ -1,13 +1,33 @@
-# Task 2 – Plain-English → browser test (Python + Playwright + Claude)
+# Task 2 – Plain-English → browser test (Python + Playwright + AI provider)
 
-```bash
-pip install -r requirements.txt && playwright install chromium
-export ANTHROPIC_API_KEY=sk-ant-...        # optional: export LLM_MODEL=<model name>
+This runner supports either Google Gemini or Groq. It loads keys from a `.env` file in this directory, so you can keep credentials out of source control.
 
-python nl_test_runner.py "Log in as a customer and verify the dashboard is shown" --url https://phptravels.com/demo --headed
-python nl_test_runner.py "Search for hotels in Dubai and verify results are listed" --url https://phptravels.com/demo
-python nl_test_runner.py --file my_test.txt --url https://any-other-site.com
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+playwright install chromium
 ```
+
+Add either key to `.env` in this folder:
+
+```env
+GOOGLE_API_KEY=...
+# or
+GROQ_API_KEY=...
+LLM_MODEL=gemini-3.8-flash   # or any other enabled model
+# optional fallback model when the primary model is busy
+LLM_FALLBACK_MODEL=...
+```
+
+Run a test:
+
+```powershell
+python nl_test_runner.py "Log in as a customer and verify the dashboard is shown" --url "https://phptravels.com/demo" --headed
+python nl_test_runner.py "Search for hotels in Dubai and verify results are listed" --url "https://phptravels.com/demo"
+python nl_test_runner.py --file my_test.txt --url "https://any-other-site.com"
+```
+
 Output: step log, `PASS`/`FAIL` with reason + evidence, `runs/<time>/report.json`, `runs/<time>/final.png`.
 Exit code `0` = pass, `1` = fail.
 
