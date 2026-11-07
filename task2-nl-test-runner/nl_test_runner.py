@@ -26,14 +26,14 @@ load_dotenv()
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-PROVIDER = "google" if GOOGLE_API_KEY else "groq" if GROQ_API_KEY else None
+PROVIDER = "groq" if GROQ_API_KEY else "google" if GOOGLE_API_KEY else None
 
 if PROVIDER == "google":
     MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
 elif PROVIDER == "groq":
-    MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+    MODEL = os.environ.get("LLM_MODEL", "qwen/qwen3.8-27b")
 else:
-    MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
+    MODEL = os.environ.get("LLM_MODEL", "qwen/qwen3.8-27b")
 
 FALLBACK_MODEL = os.environ.get("LLM_FALLBACK_MODEL")
 TRANSIENT_API_ERROR_CODES = {429, 500, 502, 503, 504}
@@ -131,9 +131,12 @@ def ask_llm(client, test_case, history, snap_text):
             else:
                 completion = client.chat.completions.create(
                     model=active_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
                     temperature=0,
+                    max_tokens=500,
                 )
                 raw = completion.choices[0].message.content or ""
         except Exception as exc:
@@ -175,13 +178,25 @@ def settle(page):
     page.wait_for_timeout(500)
 
 
-def execute(page, act, items):
+def execute(page, act, items, default_credentials=None):
     a = act["action"]
     if a == "goto":
         page.goto(act["url"], wait_until="domcontentloaded", timeout=30000)
     elif a in ("click", "fill", "select", "check"):
         loc = page.locator(f'[data-agent-id="{act["id"]}"]').first
-        if a == "click":
+        if default_credentials and a == "fill":
+            item = next((i for i in items if i["id"] == act.get("id")), None)
+            field_name = (item or {}).get("label", "")
+            field_placeholder = (item or {}).get("placeholder", "")
+            field_text = (item or {}).get("text", "")
+            combined = f"{field_name} {field_placeholder} {field_text}".lower()
+            if "email" in combined or "user" in combined or (item and item.get("type") == "email"):
+                loc.fill(default_credentials[0], timeout=7000)
+            elif "password" in combined or (item and item.get("type") == "password"):
+                loc.fill(default_credentials[1], timeout=7000)
+            else:
+                loc.fill(str(act["value"]), timeout=7000)
+        elif a == "click":
             loc.click(timeout=7000)
         elif a == "check":
             loc.check(timeout=7000)
@@ -217,6 +232,19 @@ def describe(act, items):
     return d
 
 
+def get_default_demo_credentials(test_case, url):
+    if not url:
+        return None
+    test_text = (test_case or "").lower()
+    if "login" not in test_text and "sign in" not in test_text:
+        return None
+    if "@" in test_case or "password" in test_text:
+        return None
+    if "phptravels" in url.lower():
+        return ("user@phptravels.com", "demouser")
+    return None
+
+
 def run(test_case, url, headed, max_steps, outdir):
     if PROVIDER == "google":
         client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
@@ -227,6 +255,7 @@ def run(test_case, url, headed, max_steps, outdir):
         raise RuntimeError("Set GOOGLE_API_KEY or GROQ_API_KEY in the environment or .env file.")
     outdir.mkdir(parents=True, exist_ok=True)
     history, steps = [], []
+    default_credentials = get_default_demo_credentials(test_case, url)
     verdict = {"verdict": "fail", "reason": "Step limit reached without a verdict", "evidence": ""}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headed)
@@ -235,6 +264,14 @@ def run(test_case, url, headed, max_steps, outdir):
         if url:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             settle(page)
+            if default_credentials and "login" in (test_case or "").lower():
+                email, password = default_credentials
+                try:
+                    page.locator('#email').fill(email)
+                    page.locator('#password').fill(password)
+                    print(f"  default login creds: {email} / {password}")
+                except Exception:
+                    pass
         for n in range(1, max_steps + 1):
             page = ctx.pages[-1]
             snap = page.evaluate(SNAPSHOT_JS)
@@ -255,7 +292,7 @@ def run(test_case, url, headed, max_steps, outdir):
                 break
             desc = describe(act, snap["items"])
             try:
-                execute(page, act, snap["items"])
+                execute(page, act, snap["items"], default_credentials)
                 result = "ok"
             except Exception as e:
                 result = "ERROR: " + str(e).splitlines()[0][:150]

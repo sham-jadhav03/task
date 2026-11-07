@@ -9,15 +9,20 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Add either key to `.env` in this folder:
+For the current Groq setup, add this to `.env` in this folder:
+
+```env
+GROQ_API_KEY=...
+LLM_MODEL=qwen/qwen3.8-27b
+# optional fallback model when the primary model is busy
+LLM_FALLBACK_MODEL=qwen/qwen3.8-27b
+```
+
+If you prefer Google Gemini instead, use:
 
 ```env
 GOOGLE_API_KEY=...
-# or
-GROQ_API_KEY=...
-LLM_MODEL=gemini-3.8-flash   # or any other enabled model
-# optional fallback model when the primary model is busy
-LLM_FALLBACK_MODEL=...
+LLM_MODEL=gemini-3.8-flash
 ```
 
 Run a test:
